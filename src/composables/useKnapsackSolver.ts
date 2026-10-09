@@ -1,102 +1,101 @@
 import { ref, onUnmounted } from 'vue';
 import KnapsackWorker from '../workers/knapsack.worker.ts?worker&inline';
-import { findBestCombinations, type CombinationResult, type Item } from '../utils/knapsack';
+import {
+  findBestCombinations,
+  type CombinationResult,
+  type Item,
+} from '../utils/knapsack';
 
 export function useKnapsackSolver() {
   const isCalculating = ref(false);
   const results = ref<CombinationResult[]>([]);
-  const error = ref<string | null>(null);
+  const executionTime = ref<number>(0);
   let worker: Worker | null = null;
-  let currentTask: { items: Item[]; targetBudget: number } | null = null;
 
-  const solveOnMainThread = (items: Item[], targetBudget: number) => {
+  const solveOnMainThread = (items: Item[], targetBudget: number, maxResults: number) => {
+    const startTime = performance.now();
     try {
-      results.value = findBestCombinations(items, targetBudget);
-      error.value = null;
-    } catch (err) {
-      console.error('[主線程計算錯誤]:', err);
-      error.value = '商品組合計算失敗，請稍後再試。';
+      results.value = findBestCombinations(items, targetBudget, maxResults);
+      executionTime.value = Number((performance.now() - startTime).toFixed(2));
+    } catch (error) {
+      console.error('[商品組合計算錯誤]:', error);
+      results.value = [];
     } finally {
       isCalculating.value = false;
     }
   };
 
-  const handleWorkerFailure = (message: string, items: Item[], targetBudget: number) => {
-    console.error(message);
-    worker?.terminate();
-    worker = null;
-    currentTask = null;
-    solveOnMainThread(items, targetBudget);
-  };
-
-  // 初始化 Worker 並設定監聽
-  const initWorker = () => {
-    if (!worker) {
-      worker = new KnapsackWorker();
-
-      // 接收來自 Worker 的計算結果
-      worker.onmessage = (e: MessageEvent<{ combinations: CombinationResult[] }>) => {
-        results.value = e.data.combinations;
-        error.value = null;
-        isCalculating.value = false;
-      };
-
-      worker.onerror = (event) => {
-        event.preventDefault();
-        if (currentTask) {
-          handleWorkerFailure(
-            '[Worker 執行錯誤，改由主執行緒計算]',
-            currentTask.items,
-            currentTask.targetBudget,
-          );
-        }
-      };
-
-      worker.onmessageerror = () => {
-        if (currentTask) {
-          handleWorkerFailure(
-            '[Worker 訊息錯誤，改由主執行緒計算]',
-            currentTask.items,
-            currentTask.targetBudget,
-          );
-        }
-      };
-    }
-  };
-
-  // 執行計算的函數
-  const solve = (items: Item[], targetBudget: number) => {
-    if (targetBudget <= 0 || items.length === 0) {
+  const solve = (items: Item[], targetBudget: number, maxResults = 5) => {
+    if (!targetBudget || targetBudget <= 0 || items.length === 0) {
       results.value = [];
       return;
     }
 
-    error.value = null;
-    results.value = [];
+    worker?.terminate();
+    worker = null;
     isCalculating.value = true;
-    currentTask = { items, targetBudget };
+    results.value = [];
+    executionTime.value = 0;
+
+    let currentWorker: Worker;
+    try {
+      currentWorker = new KnapsackWorker();
+    } catch (error) {
+      console.error('[Knapsack Worker 啟動失敗，改由主執行緒計算]:', error);
+      solveOnMainThread(items, targetBudget, maxResults);
+      return;
+    }
+
+    worker = currentWorker;
+
+    currentWorker.onmessage = (
+      e: MessageEvent<{
+        combinations: CombinationResult[];
+        executionTimeMs: number;
+      }>
+    ) => {
+      if (worker !== currentWorker) return;
+      results.value = e.data.combinations;
+      executionTime.value = e.data.executionTimeMs;
+      isCalculating.value = false;
+      currentWorker.terminate();
+      worker = null;
+    };
+
+    const fallbackToMainThread = (error: Event | MessageEvent) => {
+      if (worker !== currentWorker) return;
+      error.preventDefault();
+      console.error('[Knapsack Worker 無法執行，改由主執行緒計算]:', error);
+      currentWorker.terminate();
+      worker = null;
+      solveOnMainThread(items, targetBudget, maxResults);
+    };
+
+    currentWorker.onerror = fallbackToMainThread;
+    currentWorker.onmessageerror = fallbackToMainThread;
 
     try {
-      initWorker();
-      worker?.postMessage({ items, targetBudget });
-    } catch (err) {
-      handleWorkerFailure('[Worker 啟動或通訊錯誤，改由主執行緒計算]', items, targetBudget);
+      currentWorker.postMessage({ items, targetBudget, maxResults });
+    } catch (error) {
+      console.error('[Knapsack Worker 啟動失敗，改由主執行緒計算]:', error);
+      currentWorker.terminate();
+      worker = null;
+      solveOnMainThread(items, targetBudget, maxResults);
     }
   };
 
-  // 組件卸載時，自動銷毀 Worker 釋放記憶體
+  // 組件卸載時，自動銷毀 Worker 避免記憶體洩漏
   onUnmounted(() => {
     if (worker) {
       worker.terminate();
       worker = null;
     }
-    currentTask = null;
   });
 
   return {
     isCalculating,
     results,
-    error,
+    executionTime,
     solve,
   };
 }
